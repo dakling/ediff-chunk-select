@@ -64,7 +64,9 @@
   "List of (INDEX . OLD-STATE) for undo.")
 
 (defvar-local ediff-chunk-select--completion-callback nil
-  "Called with (ACCEPTED-P CONTENT) on finish.")
+  "Called with (ACCEPTED-P CONTENT HUNK-SUMMARY) on finish.
+HUNK-SUMMARY is an alist with keys `total', `accepted', `rejected',
+and `all-accepted'.")
 
 (defvar-local ediff-chunk-select--active nil
   "Non-nil when chunk-select is active in this ediff session.")
@@ -304,7 +306,15 @@ called from the quit hook to avoid re-entrancy)."
       (when (eq (aref ediff-chunk-select--hunk-states i) 'pending)
         (aset ediff-chunk-select--hunk-states i 'rejected)))
     (let* ((result (ediff-chunk-select--build-result))
-           (any-accepted (cl-find 'accepted ediff-chunk-select--hunk-states))
+           (total (length ediff-chunk-select--hunk-states))
+           (accepted-count (cl-count 'accepted ediff-chunk-select--hunk-states))
+           (rejected-count (cl-count 'rejected ediff-chunk-select--hunk-states))
+           (any-accepted (> accepted-count 0))
+           (all-accepted (= rejected-count 0))
+           (hunk-summary `((total . ,total)
+                           (accepted . ,accepted-count)
+                           (rejected . ,rejected-count)
+                           (all-accepted . ,all-accepted)))
            (callback ediff-chunk-select--completion-callback))
       (ediff-chunk-select--delete-all-overlays)
       (setq ediff-chunk-select--active nil)
@@ -313,7 +323,7 @@ called from the quit hook to avoid re-entrancy)."
         (ediff-really-quit nil))
       ;; Call the completion callback
       (when callback
-        (funcall callback (if any-accepted t nil) result)))))
+        (funcall callback (if any-accepted t nil) result hunk-summary)))))
 
 ;;; Keymap setup
 
@@ -386,7 +396,7 @@ is placed in a new buffer called *chunk-select-result*."
    (list (read-buffer "Buffer A (original): " (current-buffer) t)
          (read-buffer "Buffer B (proposed): " (other-buffer) t)))
   (ediff-chunk-select-enable-for-session
-   (lambda (accepted-p content)
+   (lambda (accepted-p content &optional _hunk-summary)
      (if (not accepted-p)
          (message "All hunks rejected — no changes.")
        (let ((buf (get-buffer-create "*chunk-select-result*")))
@@ -403,7 +413,7 @@ is placed in a new buffer called *chunk-select-result*."
 Interactively, prompts for two files."
   (interactive "fFile A (original): \nfFile B (proposed): ")
   (ediff-chunk-select-enable-for-session
-   (lambda (accepted-p content)
+   (lambda (accepted-p content &optional _hunk-summary)
      (if (not accepted-p)
          (message "All hunks rejected — no changes.")
        (let ((buf (get-buffer-create "*chunk-select-result*")))
