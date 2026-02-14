@@ -87,13 +87,11 @@
     ('(rejected . B) 'ediff-chunk-select-rejected-B)))
 
 (defun ediff-chunk-select--diff-region (n buf-label)
-  "Return (BEG . END) for diff N in buffer BUF-LABEL (`A' or `B')."
-  (let ((buf (pcase buf-label
-               ('A ediff-buffer-A)
-               ('B ediff-buffer-B))))
-    (with-current-buffer buf
-      (cons (ediff-get-diff-posn buf-label 'beg n)
-            (ediff-get-diff-posn buf-label 'end n)))))
+  "Return (BEG . END) for diff N in buffer BUF-LABEL (`A' or `B').
+Must be called from the ediff control buffer.  `ediff-get-diff-posn'
+returns markers valid in the target buffer, so no buffer switch is needed."
+  (cons (ediff-get-diff-posn buf-label 'beg n)
+        (ediff-get-diff-posn buf-label 'end n)))
 
 (defun ediff-chunk-select--create-overlays ()
   "Create overlays for all diffs.  Must be called from the control buffer."
@@ -249,36 +247,41 @@
 (defun ediff-chunk-select--build-result ()
   "Build the result string by combining hunks from buffers A and B.
 Accepted hunks take content from B, rejected/pending from A.
-Inter-hunk regions always come from A."
-  (let ((n ediff-number-of-differences)
-        (result "")
+Inter-hunk regions always come from A.
+
+Uses overlay positions rather than `ediff-get-diff-posn' so this works
+even after `ediff-really-quit' has cleared ediff's internal diff vectors
+\(which happens before quit hooks run)."
+  (let ((n (length ediff-chunk-select--hunk-states))
+        (parts nil)
         (prev-end-a nil))
     (with-current-buffer ediff-buffer-A
       (setq prev-end-a (point-min)))
     (dotimes (i n)
-      (let* ((region-a (ediff-chunk-select--diff-region i 'A))
-             (region-b (ediff-chunk-select--diff-region i 'B))
-             (state (aref ediff-chunk-select--hunk-states i)))
-        ;; Inter-hunk text from buffer A (between previous diff end and this diff start)
-        (setq result
-              (concat result
-                      (with-current-buffer ediff-buffer-A
-                        (buffer-substring-no-properties prev-end-a (car region-a)))))
+      (let* ((ov-a (aref ediff-chunk-select--overlays-A i))
+             (ov-b (aref ediff-chunk-select--overlays-B i))
+             (state (aref ediff-chunk-select--hunk-states i))
+             (beg-a (overlay-start ov-a))
+             (end-a (overlay-end ov-a))
+             (beg-b (overlay-start ov-b))
+             (end-b (overlay-end ov-b)))
+        ;; Inter-hunk text from buffer A
+        (push (with-current-buffer ediff-buffer-A
+                (buffer-substring-no-properties prev-end-a beg-a))
+              parts)
         ;; Hunk content: from B if accepted, from A if rejected/pending
-        (setq result
-              (concat result
-                      (if (eq state 'accepted)
-                          (with-current-buffer ediff-buffer-B
-                            (buffer-substring-no-properties (car region-b) (cdr region-b)))
-                        (with-current-buffer ediff-buffer-A
-                          (buffer-substring-no-properties (car region-a) (cdr region-a))))))
-        (setq prev-end-a (cdr region-a))))
+        (push (if (eq state 'accepted)
+                  (with-current-buffer ediff-buffer-B
+                    (buffer-substring-no-properties beg-b end-b))
+                (with-current-buffer ediff-buffer-A
+                  (buffer-substring-no-properties beg-a end-a)))
+              parts)
+        (setq prev-end-a end-a)))
     ;; Remaining text after the last diff from buffer A
-    (setq result
-          (concat result
-                  (with-current-buffer ediff-buffer-A
-                    (buffer-substring-no-properties prev-end-a (point-max)))))
-    result))
+    (push (with-current-buffer ediff-buffer-A
+            (buffer-substring-no-properties prev-end-a (point-max)))
+          parts)
+    (apply #'concat (nreverse parts))))
 
 ;;; Finish / finalize
 
