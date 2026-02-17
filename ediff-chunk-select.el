@@ -560,10 +560,7 @@ Preserves buffer-local `ediff-quit-hook' across the call."
         (ignore-errors (ediff-next-difference))
         ;; Ensure control panel is selected
         (when (window-live-p ediff-control-window)
-          (select-window ediff-control-window))
-        ;; Defer Claude side-window display so it runs after all
-        ;; synchronous window operations (ediff-recenter etc.) complete
-        (run-with-idle-timer 0 nil #'ediff-chunk-select--display-claude-side-window)))))
+          (select-window ediff-control-window))))))
 
 ;; ── Review pending diffs ────────────────────────────────────────
 
@@ -713,6 +710,18 @@ Also removes from pending diff queue if queued."
        claude-code-ide-mcp--sessions)))
   (funcall orig-fn arguments))
 
+;; ── Recenter advice ──────────────────────────────────────────────
+
+(defun ediff-chunk-select--after-recenter (&rest _)
+  "Ensure Claude side window is displayed after `ediff-recenter'.
+Only acts when chunk-select is active in the current control buffer.
+Preserves the selected window (typically the control panel)."
+  (when (bound-and-true-p ediff-chunk-select--active)
+    (let ((ctl-win (selected-window)))
+      (ediff-chunk-select--display-claude-side-window)
+      (when (window-live-p ctl-win)
+        (select-window ctl-win)))))
+
 ;; ── Setup ───────────────────────────────────────────────────────
 
 ;;;###autoload
@@ -723,6 +732,9 @@ Installs advice on openDiff/closeTab handlers and mode-line lighter."
               :around #'ediff-chunk-select--open-diff-advice)
   (advice-add 'claude-code-ide-mcp-handle-close-tab
               :around #'ediff-chunk-select--close-tab-advice)
+  ;; Ensure Claude side window survives every ediff-recenter call
+  (advice-add 'ediff-recenter
+              :after #'ediff-chunk-select--after-recenter)
   (unless (memq 'ediff-chunk-select--pending-lighter global-mode-string)
     (push 'ediff-chunk-select--pending-lighter global-mode-string)))
 
