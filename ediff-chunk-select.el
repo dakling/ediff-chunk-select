@@ -560,7 +560,22 @@ Preserves buffer-local `ediff-quit-hook' across the call."
         (ignore-errors (ediff-next-difference))
         ;; Ensure control panel is selected
         (when (window-live-p ediff-control-window)
-          (select-window ediff-control-window))))))
+          (select-window ediff-control-window))
+        ;; When called from a process filter (e.g. websocket MCP handler),
+        ;; side-window changes may not survive to the display.  Schedule
+        ;; a deferred display that fires once Emacs goes idle after the
+        ;; entire handler chain returns, with explicit focus preservation.
+        (let ((ctl-buf (current-buffer)))
+          (run-with-idle-timer
+           0 nil
+           (lambda ()
+             (when (buffer-live-p ctl-buf)
+               (with-current-buffer ctl-buf
+                 (when ediff-chunk-select--active
+                   (ediff-chunk-select--display-claude-side-window)
+                   (when (window-live-p ediff-control-window)
+                     (select-window ediff-control-window))))))))))))
+
 
 ;; ── Review pending diffs ────────────────────────────────────────
 
