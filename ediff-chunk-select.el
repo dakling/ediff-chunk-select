@@ -561,9 +561,9 @@ Preserves buffer-local `ediff-quit-hook' across the call."
         ;; Ensure control panel is selected
         (when (window-live-p ediff-control-window)
           (select-window ediff-control-window))
-        ;; Re-display Claude after ediff-next-difference (which triggers
-        ;; ediff-recenter and may rebuild windows without our side window)
-        (ediff-chunk-select--display-claude-side-window)))))
+        ;; Defer Claude side-window display so it runs after all
+        ;; synchronous window operations (ediff-recenter etc.) complete
+        (run-with-idle-timer 0 nil #'ediff-chunk-select--display-claude-side-window)))))
 
 ;; ── Review pending diffs ────────────────────────────────────────
 
