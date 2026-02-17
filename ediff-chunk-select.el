@@ -11,11 +11,16 @@
 ;; Each hunk can be independently accepted (use proposed change from B)
 ;; or rejected (keep original from A).  The result is assembled from
 ;; the selected combination of hunks.
+;;
+;; Optional Claude Code IDE integration is available via
+;; `ediff-chunk-select-claude-code-setup'.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'ediff)
+
+;;; ─── Section 1: Core chunk-select ──────────────────────────────
 
 ;;; Faces
 
@@ -354,31 +359,39 @@ Consumes `ediff-chunk-select--pending-callback'."
     (let ((callback ediff-chunk-select--pending-callback))
       (setq ediff-chunk-select--pending-callback nil)
       (when ediff-control-buffer
-        (with-current-buffer ediff-control-buffer
-          (setq ediff-chunk-select--active t)
-          (setq ediff-chunk-select--completion-callback callback)
-          (setq ediff-chunk-select--hunk-states
-                (make-vector ediff-number-of-differences 'pending))
-          (setq ediff-chunk-select--undo-stack nil)
-          ;; Make buffers read-only during review
-          (when (buffer-live-p ediff-buffer-A)
-            (with-current-buffer ediff-buffer-A
-              (setq buffer-read-only t)))
-          (when (buffer-live-p ediff-buffer-B)
-            (with-current-buffer ediff-buffer-B
-              (setq buffer-read-only t)))
-          ;; Create overlays and setup keybindings
-          (ediff-chunk-select--create-overlays)
-          (ediff-chunk-select--setup-keymap)
-          (ediff-chunk-select--update-header)
-          ;; Override quit to go through our finish flow
-          ;; Pass skip-quit=t since ediff-really-quit is already running
-          (setq-local ediff-quit-hook
-                      (list (lambda ()
-                              (when ediff-chunk-select--active
-                                (ediff-chunk-select-finish t))))))))))
+        (ediff-chunk-select-activate ediff-control-buffer callback)))))
 
 ;;; Public API
+
+;;;###autoload
+(defun ediff-chunk-select-activate (control-buf callback)
+  "Activate chunk-select in CONTROL-BUF with CALLBACK.
+CALLBACK is called with (ACCEPTED-P CONTENT HUNK-SUMMARY) on finish.
+Use this when the ediff session was created via `save-window-excursion'
+and the startup hook didn't fire in the normal window context."
+  (with-current-buffer control-buf
+    (setq ediff-chunk-select--active t)
+    (setq ediff-chunk-select--completion-callback callback)
+    (setq ediff-chunk-select--hunk-states
+          (make-vector (or ediff-number-of-differences 0) 'pending))
+    (setq ediff-chunk-select--undo-stack nil)
+    (when (buffer-live-p ediff-buffer-A)
+      (with-current-buffer ediff-buffer-A
+        (setq buffer-read-only t)))
+    (when (buffer-live-p ediff-buffer-B)
+      (with-current-buffer ediff-buffer-B
+        (setq buffer-read-only t)))
+    (ediff-chunk-select--create-overlays)
+    (ediff-chunk-select--setup-keymap)
+    (ediff-chunk-select--update-header)
+    ;; The trailing t tells run-hooks to also run the global value
+    ;; (ediff-cleanup-mess), which kills the control buffer and
+    ;; auxiliary buffers.
+    (setq-local ediff-quit-hook
+                (list (lambda ()
+                        (when ediff-chunk-select--active
+                          (ediff-chunk-select-finish t)))
+                      t))))
 
 ;;;###autoload
 (defun ediff-chunk-select-enable-for-session (&optional callback)
@@ -424,7 +437,294 @@ Interactively, prompts for two files."
          (message "Result assembled with accepted hunks.")))))
   (ediff-files file-a file-b))
 
-;; Install hooks
+;;; ─── Section 2: Claude Code IDE integration ────────────────────
+;;
+;; Optional integration with claude-code-ide.  None of the symbols
+;; below are required at byte-compile time; everything is guarded
+;; with `bound-and-true-p', `fboundp', or `declare-function'.
+;; Call `ediff-chunk-select-claude-code-setup' to activate.
+
+(defvar claude-code-ide-mcp--sessions)
+(defvar claude-code-ide-show-claude-window-in-ediff)
+(declare-function claude-code-ide-mcp-session-active-diffs "claude-code-ide-mcp-handlers")
+(declare-function claude-code-ide-mcp-session-project-dir "claude-code-ide-mcp-handlers")
+(declare-function claude-code-ide--display-buffer-in-side-window "claude-code-ide")
+(declare-function claude-code-ide--get-buffer-name "claude-code-ide")
+(declare-function claude-code-ide--session-buffer-p "claude-code-ide")
+(declare-function claude-code-ide-mcp--find-session-for-file "claude-code-ide-mcp-handlers")
+(declare-function claude-code-ide-mcp--get-current-session "claude-code-ide-mcp-handlers")
+(declare-function claude-code-ide-mcp--get-active-diffs "claude-code-ide-mcp-handlers")
+(declare-function claude-code-ide-mcp-complete-deferred "claude-code-ide-mcp-handlers")
+(declare-function claude-code-ide-mcp--handle-ediff-quit "claude-code-ide-mcp-handlers")
+
+;; ── Diff queue ──────────────────────────────────────────────────
+
+(defvar ediff-chunk-select-pending-queue nil
+  "FIFO queue of (tab-name . control-buffer) for deferred diffs.")
+
+(defvar ediff-chunk-select--pending-lighter
+  '(:eval (if ediff-chunk-select-pending-queue
+              (format " [%d diff%s]"
+                      (length ediff-chunk-select-pending-queue)
+                      (if (= 1 (length ediff-chunk-select-pending-queue)) "" "s"))
+            ""))
+  "Mode-line lighter showing pending diff count.")
+(put 'ediff-chunk-select--pending-lighter 'risky-local-variable t)
+
+(defvar ediff-chunk-select--current-tab-name nil
+  "Tab-name of the diff currently being set up.")
+
+(defvar ediff-chunk-select--current-file-path nil
+  "File path of the diff currently being set up.")
+
+;; ── Helpers ─────────────────────────────────────────────────────
+
+(defun ediff-chunk-select--display-claude-side-window ()
+  "Re-display the Claude Code side window if configured."
+  (when (bound-and-true-p claude-code-ide-show-claude-window-in-ediff)
+    (catch 'displayed
+      (maphash
+       (lambda (_proj-dir session)
+         (when-let* ((proj (claude-code-ide-mcp-session-project-dir session))
+                     (bn (claude-code-ide--get-buffer-name proj))
+                     (cb (get-buffer bn)))
+           (when (buffer-live-p cb)
+             (claude-code-ide--display-buffer-in-side-window cb)
+             (throw 'displayed t))))
+       claude-code-ide-mcp--sessions))))
+
+(defun ediff-chunk-select--find-diff-info (tab-name)
+  "Find (session . diff-info) for TAB-NAME across all MCP sessions."
+  (catch 'found
+    (maphash
+     (lambda (_proj-dir session)
+       (let* ((active-diffs (claude-code-ide-mcp-session-active-diffs session))
+              (diff-info (gethash tab-name active-diffs)))
+         (when diff-info
+           (throw 'found (cons session diff-info)))))
+     claude-code-ide-mcp--sessions)
+    nil))
+
+(defun ediff-chunk-select--find-control-buffer (buffer-a)
+  "Find the ediff control buffer whose `ediff-buffer-A' is BUFFER-A."
+  (cl-find-if (lambda (buf)
+                (and (buffer-live-p buf)
+                     (eq (buffer-local-value 'ediff-buffer-A buf) buffer-a)))
+              (buffer-list)))
+
+;; ── Window management ───────────────────────────────────────────
+
+(defun ediff-chunk-select--setup-windows (buf-a buf-b buf-c control-buf)
+  "Ediff window setup that preserves the Claude Code side window.
+Wraps `ediff-setup-windows-plain': removes side windows before
+the layout build (which uses `other-window' and would land on a
+surviving side window), then re-displays Claude afterward.
+Preserves buffer-local `ediff-quit-hook' across the call."
+  ;; Save quit hook — ediff-setup-control-buffer (called inside
+  ;; ediff-setup-windows-plain) may reset buffer state.
+  (let ((saved-quit-hook (buffer-local-value 'ediff-quit-hook control-buf))
+        (saved-chunk-active (buffer-local-value 'ediff-chunk-select--active control-buf)))
+    ;; Remove side windows so other-window doesn't cycle into them
+    (dolist (window (window-list))
+      (when (window-parameter window 'window-side)
+        (ignore-errors (delete-window window))))
+    (ediff-setup-windows-plain buf-a buf-b buf-c control-buf)
+    ;; Restore quit hook and chunk-select state
+    (with-current-buffer control-buf
+      (setq-local ediff-quit-hook saved-quit-hook)
+      (setq ediff-chunk-select--active saved-chunk-active))
+    ;; ediff-setup-windows-plain ends with control window selected.
+    ;; Re-display Claude side window.
+    (let ((ctl-win (selected-window)))
+      (ediff-chunk-select--display-claude-side-window)
+      ;; Keep control window selected
+      (select-window ctl-win))))
+
+(defun ediff-chunk-select--show-ediff (control-buf)
+  "Display the ediff session for CONTROL-BUF in the current frame."
+  (when (buffer-live-p control-buf)
+    (with-current-buffer control-buf
+      (when (and (buffer-live-p ediff-buffer-A) (buffer-live-p ediff-buffer-B))
+        ;; Use our wrapper as the window-setup-function for this session.
+        ;; It clears side windows before ediff-setup-windows-plain (preventing
+        ;; the other-window bug), re-adds Claude after, and preserves quit hooks.
+        (setq-local ediff-window-setup-function
+                    #'ediff-chunk-select--setup-windows)
+        ;; Build layout via ediff's dispatcher (calls our wrapper since
+        ;; ediff-keep-window-config is nil on first call).
+        ;; ediff-setup-control-buffer stamps ediff-window-config-saved,
+        ;; so subsequent j/k match and skip rebuilding.
+        (ediff-setup-windows ediff-buffer-A ediff-buffer-B
+                             ediff-buffer-C control-buf)
+        ;; Jump to first diff
+        (ignore-errors (ediff-next-difference))
+        ;; Ensure control panel is selected
+        (when (window-live-p ediff-control-window)
+          (select-window ediff-control-window))))))
+
+;; ── Review pending diffs ────────────────────────────────────────
+
+;;;###autoload
+(defun ediff-chunk-select-review-pending ()
+  "Pop the oldest pending diff from the queue and display it for review."
+  (interactive)
+  (unless ediff-chunk-select-pending-queue
+    (user-error "No pending diffs to review"))
+  (let* ((entry (car (last ediff-chunk-select-pending-queue)))
+         (tab-name (car entry))
+         (control-buf (cdr entry)))
+    ;; Remove from queue (FIFO: take from end)
+    (setq ediff-chunk-select-pending-queue
+          (butlast ediff-chunk-select-pending-queue))
+    (force-mode-line-update t)
+    (if (not (buffer-live-p control-buf))
+        (progn
+          (message "Diff session for %s is no longer alive, skipping." tab-name)
+          (when ediff-chunk-select-pending-queue
+            (ediff-chunk-select-review-pending)))
+      ;; Update saved-winconf to current layout so restoration goes back to HERE
+      (when-let ((found (ediff-chunk-select--find-diff-info tab-name)))
+        (let* ((session (car found))
+               (active-diffs (claude-code-ide-mcp-session-active-diffs session))
+               (diff-info (gethash tab-name active-diffs)))
+          (when diff-info
+            (setf (alist-get 'saved-winconf diff-info)
+                  (current-window-configuration))
+            (puthash tab-name diff-info active-diffs))))
+      (ediff-chunk-select--show-ediff control-buf))))
+
+;; ── Advice for openDiff / closeTab handlers ─────────────────────
+
+(defun ediff-chunk-select--open-diff-advice (orig-fn arguments)
+  "Set up chunk-select callback before claude-code-ide opens ediff.
+Queues the diff instead of displaying it immediately."
+  ;; Store in defvars to avoid lexical scoping issues across macro boundaries
+  (setq ediff-chunk-select--current-tab-name (alist-get 'tab_name arguments))
+  (setq ediff-chunk-select--current-file-path (alist-get 'old_file_path arguments))
+  (let* ((the-tab-name ediff-chunk-select--current-tab-name)
+         (the-file-path ediff-chunk-select--current-file-path)
+         (in-claude-window (claude-code-ide--session-buffer-p (current-buffer)))
+         (chunk-callback
+          (lambda (accepted-p content &optional hunk-summary)
+            (let* ((session (or (claude-code-ide-mcp--find-session-for-file the-file-path)
+                                (claude-code-ide-mcp--get-current-session)))
+                   (active-diffs (when session
+                                   (claude-code-ide-mcp--get-active-diffs session)))
+                   (diff-info (when active-diffs
+                                (gethash the-tab-name active-diffs)))
+                   (saved-winconf (when diff-info
+                                    (alist-get 'saved-winconf diff-info))))
+              ;; Defer window restoration so it runs AFTER ediff-really-quit
+              (when saved-winconf
+                (run-with-idle-timer
+                 0 nil
+                 (lambda ()
+                   (set-window-configuration saved-winconf)
+                   (ediff-chunk-select--display-claude-side-window))))
+              ;; Send deferred MCP response
+              (when session
+                (run-with-idle-timer
+                 0 nil
+                 (lambda ()
+                   (if accepted-p
+                       (let* ((total (alist-get 'total hunk-summary 0))
+                              (accepted-count (alist-get 'accepted hunk-summary 0))
+                              (rejected-count (alist-get 'rejected hunk-summary 0))
+                              (all-accepted (alist-get 'all-accepted hunk-summary t))
+                              (response
+                               (if all-accepted
+                                   (list `((type . "text") (text . "FILE_SAVED"))
+                                         `((type . "text") (text . ,content)))
+                                 (list `((type . "text") (text . "FILE_SAVED"))
+                                       `((type . "text") (text . ,content))
+                                       `((type . "text")
+                                         (text . ,(format "PARTIAL_EDIT: The user accepted %d of %d proposed changes. %d change(s) were rejected and the original code was kept for those hunks. The saved file content above reflects only the accepted changes. Do NOT re-propose the rejected changes."
+                                                          accepted-count total rejected-count)))))))
+                         (claude-code-ide-mcp-complete-deferred
+                          session "openDiff" response the-tab-name)
+                         (when active-diffs
+                           (puthash the-tab-name
+                                    (cons '(responded . t) diff-info)
+                                    active-diffs)))
+                     (claude-code-ide-mcp-complete-deferred
+                      session "openDiff"
+                      (list `((type . "text") (text . "DIFF_REJECTED"))
+                            `((type . "text") (text . ,the-tab-name)))
+                      the-tab-name)
+                     (when active-diffs
+                       (puthash the-tab-name
+                                (cons '(responded . t) diff-info)
+                                active-diffs))))))))))
+    ;; Call original inside save-window-excursion to prevent display takeover
+    (let ((result (save-window-excursion (funcall orig-fn arguments))))
+      ;; Windows are now restored. Set up chunk-select and queue the diff.
+      (condition-case err
+          (let ((control-buf (car ediff-session-registry)))
+            (when (and control-buf (buffer-live-p control-buf))
+              ;; Activate chunk-select for this ediff session
+              (ediff-chunk-select-activate control-buf chunk-callback)
+              ;; Show immediately or queue based on whether user is in Claude window
+              (if in-claude-window
+                  (progn
+                    ;; Update saved-winconf so restoration returns to current layout
+                    (when-let ((found (ediff-chunk-select--find-diff-info the-tab-name)))
+                      (let* ((session (car found))
+                             (active-diffs (claude-code-ide-mcp-session-active-diffs session))
+                             (diff-info (gethash the-tab-name active-diffs)))
+                        (when diff-info
+                          (setf (alist-get 'saved-winconf diff-info)
+                                (current-window-configuration))
+                          (puthash the-tab-name diff-info active-diffs))))
+                    (ediff-chunk-select--show-ediff control-buf))
+                (push (cons the-tab-name control-buf) ediff-chunk-select-pending-queue)
+                (force-mode-line-update t)
+                (message "[diff-queue] Queued diff for %s (%d pending)"
+                         the-tab-name (length ediff-chunk-select-pending-queue)))))
+        (error
+         (message "[chunk-select] Error during setup: %s" err)))
+      result)))
+
+(defun ediff-chunk-select--close-tab-advice (orig-fn arguments)
+  "Deactivate chunk-select before Claude closes a diff tab.
+Also removes from pending diff queue if queued."
+  (when-let ((tab-name (alist-get 'tab_name arguments)))
+    ;; Remove from pending queue if present
+    (setq ediff-chunk-select-pending-queue
+          (cl-remove-if (lambda (entry) (equal (car entry) tab-name))
+                        ediff-chunk-select-pending-queue))
+    (force-mode-line-update t)
+    (catch 'done
+      (maphash
+       (lambda (_proj-dir session)
+         (let* ((session-diffs (claude-code-ide-mcp-session-active-diffs session))
+                (diff-info (gethash tab-name session-diffs)))
+           (when diff-info
+             (when-let ((control-buf (alist-get 'control-buffer diff-info)))
+               (when (buffer-live-p control-buf)
+                 (with-current-buffer control-buf
+                   (when (bound-and-true-p ediff-chunk-select--active)
+                     (ediff-chunk-select--delete-all-overlays)
+                     (setq ediff-chunk-select--active nil)
+                     (setq ediff-quit-hook nil)))))
+             (throw 'done t))))
+       claude-code-ide-mcp--sessions)))
+  (funcall orig-fn arguments))
+
+;; ── Setup ───────────────────────────────────────────────────────
+
+;;;###autoload
+(defun ediff-chunk-select-claude-code-setup ()
+  "Activate Claude Code integration for ediff-chunk-select.
+Installs advice on openDiff/closeTab handlers and mode-line lighter."
+  (advice-add 'claude-code-ide-mcp-handle-open-diff
+              :around #'ediff-chunk-select--open-diff-advice)
+  (advice-add 'claude-code-ide-mcp-handle-close-tab
+              :around #'ediff-chunk-select--close-tab-advice)
+  (unless (memq 'ediff-chunk-select--pending-lighter global-mode-string)
+    (push 'ediff-chunk-select--pending-lighter global-mode-string)))
+
+;;; ─── Hook installation ─────────────────────────────────────────
+
 (add-hook 'ediff-startup-hook #'ediff-chunk-select--startup-hook)
 (add-hook 'ediff-keymap-setup-hook #'ediff-chunk-select--setup-keymap)
 
