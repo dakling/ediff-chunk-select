@@ -560,22 +560,7 @@ Preserves buffer-local `ediff-quit-hook' across the call."
         (ignore-errors (ediff-next-difference))
         ;; Ensure control panel is selected
         (when (window-live-p ediff-control-window)
-          (select-window ediff-control-window))
-        ;; When called from a process filter (e.g. websocket MCP handler),
-        ;; side-window changes may not survive to the display.  Schedule
-        ;; a deferred display that fires once Emacs goes idle after the
-        ;; entire handler chain returns, with explicit focus preservation.
-        (let ((ctl-buf (current-buffer)))
-          (run-with-idle-timer
-           0 nil
-           (lambda ()
-             (when (buffer-live-p ctl-buf)
-               (with-current-buffer ctl-buf
-                 (when ediff-chunk-select--active
-                   (ediff-chunk-select--display-claude-side-window)
-                   (when (window-live-p ediff-control-window)
-                     (select-window ediff-control-window))))))))))))
-
+          (select-window ediff-control-window))))))
 
 ;; ── Review pending diffs ────────────────────────────────────────
 
@@ -670,34 +655,36 @@ Queues the diff instead of displaying it immediately."
                        (puthash the-tab-name
                                 (cons '(responded . t) diff-info)
                                 active-diffs))))))))))
-    ;; Call original inside save-window-excursion to prevent display takeover
-    (let ((result (save-window-excursion (funcall orig-fn arguments))))
-      ;; Windows are now restored. Set up chunk-select and queue the diff.
-      (condition-case err
-          (let ((control-buf (car ediff-session-registry)))
-            (when (and control-buf (buffer-live-p control-buf))
-              ;; Activate chunk-select for this ediff session
-              (ediff-chunk-select-activate control-buf chunk-callback)
-              ;; Show immediately or queue based on whether user is in Claude window
-              (if in-claude-window
-                  (progn
-                    ;; Update saved-winconf so restoration returns to current layout
-                    (when-let ((found (ediff-chunk-select--find-diff-info the-tab-name)))
-                      (let* ((session (car found))
-                             (active-diffs (claude-code-ide-mcp-session-active-diffs session))
-                             (diff-info (gethash the-tab-name active-diffs)))
-                        (when diff-info
-                          (setf (alist-get 'saved-winconf diff-info)
-                                (current-window-configuration))
-                          (puthash the-tab-name diff-info active-diffs))))
-                    (ediff-chunk-select--show-ediff control-buf))
+    (if in-claude-window
+        ;; Show immediately: let the original handler run naturally.
+        ;; Its startup hook handles window setup + Claude side window display.
+        (let ((result (funcall orig-fn arguments)))
+          (condition-case err
+              (let ((control-buf (car ediff-session-registry)))
+                (when (and control-buf (buffer-live-p control-buf))
+                  ;; Activate chunk-select on the already-displayed ediff session
+                  (ediff-chunk-select-activate control-buf chunk-callback)
+                  ;; Use our window wrapper for subsequent rebuilds (j/k)
+                  (with-current-buffer control-buf
+                    (setq-local ediff-window-setup-function
+                                #'ediff-chunk-select--setup-windows))))
+            (error
+             (message "[chunk-select] Error during setup: %s" err)))
+          result)
+      ;; Queue: use save-window-excursion to create the session without
+      ;; taking over the display.
+      (let ((result (save-window-excursion (funcall orig-fn arguments))))
+        (condition-case err
+            (let ((control-buf (car ediff-session-registry)))
+              (when (and control-buf (buffer-live-p control-buf))
+                (ediff-chunk-select-activate control-buf chunk-callback)
                 (push (cons the-tab-name control-buf) ediff-chunk-select-pending-queue)
                 (force-mode-line-update t)
                 (message "[diff-queue] Queued diff for %s (%d pending)"
-                         the-tab-name (length ediff-chunk-select-pending-queue)))))
-        (error
-         (message "[chunk-select] Error during setup: %s" err)))
-      result)))
+                         the-tab-name (length ediff-chunk-select-pending-queue))))
+          (error
+           (message "[chunk-select] Error during setup: %s" err)))
+        result))))
 
 (defun ediff-chunk-select--close-tab-advice (orig-fn arguments)
   "Deactivate chunk-select before Claude closes a diff tab.
