@@ -384,14 +384,15 @@ and the startup hook didn't fire in the normal window context."
     (ediff-chunk-select--create-overlays)
     (ediff-chunk-select--setup-keymap)
     (ediff-chunk-select--update-header)
-    ;; The trailing t tells run-hooks to also run the global value
-    ;; (ediff-cleanup-mess), which kills the control buffer and
-    ;; auxiliary buffers.
+    ;; Do NOT include t — we suppress ediff-cleanup-mess to match
+    ;; the original claude-code-ide handler which restores the saved
+    ;; window configuration synchronously in the quit hook.
+    ;; ediff-cleanup-mess rearranges windows (shows buff-A/B,
+    ;; balance-windows) which would undo our restoration.
     (setq-local ediff-quit-hook
                 (list (lambda ()
                         (when ediff-chunk-select--active
-                          (ediff-chunk-select-finish t)))
-                      t))))
+                          (ediff-chunk-select-finish t)))))))
 
 ;;;###autoload
 (defun ediff-chunk-select-enable-for-session (&optional callback)
@@ -614,13 +615,12 @@ Queues the diff instead of displaying it immediately."
                                 (gethash the-tab-name active-diffs)))
                    (saved-winconf (when diff-info
                                     (alist-get 'saved-winconf diff-info))))
-              ;; Defer window restoration so it runs AFTER ediff-really-quit
+              ;; Restore window configuration directly (synchronous).
+              ;; This works because ediff-cleanup-mess is suppressed
+              ;; (no t in quit hook), so nothing undoes our restoration.
               (when saved-winconf
-                (run-with-idle-timer
-                 0 nil
-                 (lambda ()
-                   (set-window-configuration saved-winconf)
-                   (ediff-chunk-select--display-claude-side-window))))
+                (set-window-configuration saved-winconf)
+                (ediff-chunk-select--display-claude-side-window))
               ;; Send deferred MCP response
               (when session
                 (run-with-idle-timer
